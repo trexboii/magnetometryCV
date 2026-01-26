@@ -1,111 +1,147 @@
-import cv2
 import numpy as np
-import math
-import csv
-import os
+import matplotlib.pyplot as plt
+from scipy.ndimage import rotate, uniform_filter
+from scipy.signal import fftconvolve
+from skimage.feature import peak_local_max
+from skimage import io, color, img_as_ubyte
+from skimage.filters import gaussian, threshold_otsu
+from skimage.filters.rank import equalize
+from skimage.morphology import disk
+from skimage.transform import resize
 
-# ---------- PARAMETERS ----------
-IMAGE_PATH = "./renders/whole.jpg"
-OUTPUT_IMAGE = "dipoles_detected.jpg"
-OUTPUT_CSV = "dipoles_detected.csv"
+# ------------------------------
+# Parameters
+# ------------------------------
+dipole_radius = 150       # radius of each dipole
+kernel_size = 100         # size of the kernel (should contain full dipole)
+n_orientations = 12      # number of rotations to check
+scale = 0.3 #image resize scale
+threshold_rel = 0.2 #threshold clip
 
-MIN_RADIUS = 5       # pixels (~0.35 m if 1 px ≈ 0.0716 m)
-MAX_RADIUS = 10      # pixels (~0.7 m)
-CIRCLE_SENSITIVITY = 20  # Hough param2, lower = more detections
-CONTRAST_THRESHOLD = 25  # intensity difference between halves
-GAUSSIAN_SIZE = (3,3)
-CLAHE_CLIP = 2.0
-CLAHE_TILE = (8,8)
+# ------------------------------
+# Helper: Create black/white half-circle dipole kernel
+# ------------------------------
+print("creating dipole kernel...")
+dipole_radius = int(dipole_radius * scale)
+kernel_size = int(kernel_size * scale)
+def create_half_circle_dipole_kernel(size, radius):
+    x = np.arange(size) - size // 2
+    y = np.arange(size) - size // 2
+    X, Y = np.meshgrid(x, y)
+    
+    disk_mask = (X**2 + Y**2 <= radius**2).astype(float)
+    disk_mask[X >= 0] *= -1  # left half +1, right half -1
+    
+    disk_mask -= disk_mask.mean()
+    disk_mask /= np.std(disk_mask)
+    return disk_mask
 
-# ---------- LOAD & PREPROCESS ----------
-gray = cv2.imread(IMAGE_PATH, cv2.IMREAD_GRAYSCALE)
-if gray is None:
-    raise FileNotFoundError(f"Could not read image at {IMAGE_PATH}")
+dipole_kernel = create_half_circle_dipole_kernel(kernel_size, dipole_radius)
 
-# Normalize contrast and reduce noise
-clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=CLAHE_TILE)
-enhanced = clahe.apply(gray)
-blurred = cv2.GaussianBlur(enhanced, GAUSSIAN_SIZE, 0)
+# ------------------------------
+# Load and preprocess real image
+# ------------------------------
+image_path = r"C:\Users\ASUS ZenBook 14\Desktop\Python Projects\magnetometryCV\renders\whole.jpg"  # ← change this path!
 
-# ---------- HOUGH CIRCLE DETECTION ----------
-circles = cv2.HoughCircles(
-    blurred,
-    cv2.HOUGH_GRADIENT,
-    dp=1.2,
-    minDist=15,
-    param1=100,
-    param2=CIRCLE_SENSITIVITY,
-    minRadius=MIN_RADIUS,
-    maxRadius=MAX_RADIUS
-)
 
-output = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-results = []
-
-# ---------- ANALYZE EACH CIRCLE ----------
-if circles is not None:
-    circles = np.around(circles[0, :]).astype(int)
-    for (x, y, r) in circles:
-        # Clip ROI boundaries to image
-        y1 = max(0, y - r)
-        y2 = min(enhanced.shape[0], y + r)
-        x1 = max(0, x - r)
-        x2 = min(enhanced.shape[1], x + r)
-        roi = enhanced[y1:y2, x1:x2]
-        if roi.size == 0 or roi.shape[0] < 5 or roi.shape[1] < 5:
-            continue
-
-        # Compute local gradients
-        gx = cv2.Sobel(roi, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(roi, cv2.CV_64F, 0, 1, ksize=3)
-        magnitude = np.sqrt(gx**2 + gy**2)
-        angle = np.arctan2(gy, gx)
-
-        # Weighted mean orientation (dipole axis)
-        avg_angle = np.arctan2(np.mean(np.sin(angle) * magnitude),
-                               np.mean(np.cos(angle) * magnitude))
-
-        # Sample intensity along that axis
-        line_profile = []
-        for i in range(-r, r):
-            dx = int(round(x + i * math.cos(avg_angle)))
-            dy = int(round(y + i * math.sin(avg_angle)))
-            if 0 <= dy < enhanced.shape[0] and 0 <= dx < enhanced.shape[1]:
-                line_profile.append(enhanced[dy, dx])
-
-        if len(line_profile) < 4:
-            continue
-
-        line_profile = np.array(line_profile)
-        n = len(line_profile)//2
-        contrast = abs(np.mean(line_profile[:n]) - np.mean(line_profile[n:]))
-
-        # If strong dipolar contrast → mark detection
-        if contrast > CONTRAST_THRESHOLD:
-            cv2.circle(output, (x, y), r, (0, 255, 0), 1)
-            endx = int(x + r * math.cos(avg_angle))
-            endy = int(y + r * math.sin(avg_angle))
-            cv2.arrowedLine(output, (x, y), (endx, endy), (0, 0, 255), 1, tipLength=0.3)
-
-            # Save detection record
-            results.append({
-                "x_px": x,
-                "y_px": y,
-                "radius_px": r,
-                "contrast": round(float(contrast), 2),
-                "orientation_deg": round(math.degrees(avg_angle) % 180, 1)  # 0–180 range
-            })
-
-# ---------- OUTPUT RESULTS ----------
-cv2.imwrite(OUTPUT_IMAGE, output)
-
-if results:
-    with open(OUTPUT_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"✅ Detected {len(results)} dipoles.")
-    print(f"Results saved to {os.path.abspath(OUTPUT_IMAGE)}")
-    print(f"Data saved to {os.path.abspath(OUTPUT_CSV)}")
+print("filtering image...")
+image_rgb = io.imread(image_path)
+if image_rgb.ndim == 3:
+    image = color.rgb2gray(image_rgb)
 else:
-    print("⚠️ No dipoles detected. Try lowering CONTRAST_THRESHOLD or adjusting Hough parameters.")
+    image = image_rgb.astype(float)
+image = resize(image, (int(image.shape[0]*scale), int(image.shape[1]*scale)),
+               anti_aliasing=True)
+# Light smoothing + normalization
+image = gaussian(image, sigma=1)
+image = (image - image.mean()) / image.std()
+
+# Local contrast enhancement 
+image_ubyte = img_as_ubyte((image - image.min()) / (image.max() - image.min()))
+image_eq = equalize(image_ubyte, footprint=disk(dipole_radius))
+image = image_eq / 255.0
+image = (image - image.mean()) / image.std()
+
+# ------------------------------
+# Matched filtering across rotations
+# ------------------------------
+response = np.zeros_like(image)
+print("steerable matched filtering...")
+for i in range(n_orientations):
+    angle = i * 360 / n_orientations
+    rotated_kernel = rotate(dipole_kernel, angle, reshape=False)
+    conv = fftconvolve(image, rotated_kernel, mode='same')
+    
+    # Local normalization (reduces false edges)
+    local_mean = uniform_filter(image, size=dipole_radius)
+    local_sq_mean = uniform_filter(image**2, size=dipole_radius)
+    local_var = np.clip(local_sq_mean - local_mean**2, a_min=0, a_max=None)
+    local_std = np.sqrt(local_var)
+    conv_norm = conv - local_std  # less harsh normalization
+
+
+    # Clean up any numerical issues
+    conv_norm[~np.isfinite(conv_norm)] = 0
+
+    
+    response = np.maximum(response, conv_norm)
+
+# ------------------------------
+# Mask out image borders
+# ------------------------------
+
+border = dipole_radius
+response[:border, :] = 0
+response[-border:, :] = 0
+response[:, :border] = 0
+response[:, -border:] = 0
+
+# ------------------------------
+# Adaptive thresholding and peak detection
+# ------------------------------
+print("detecting dipoles...")
+
+peaks = peak_local_max(response, min_distance=dipole_radius, threshold_rel=threshold_rel)
+
+
+# ------------------------------
+# Post-filter peaks by local contrast symmetry
+# ------------------------------
+valid_peaks = []
+for y, x in peaks:
+    patch = image[max(0, y - dipole_radius):y + dipole_radius,
+                  max(0, x - dipole_radius):x + dipole_radius]
+    if patch.shape[0] < dipole_radius or patch.shape[1] < dipole_radius:
+        continue
+    left_mean = np.mean(patch[:, :patch.shape[1]//2])
+    right_mean = np.mean(patch[:, patch.shape[1]//2:])
+    contrast = abs(left_mean - right_mean)
+    if contrast > 0.2:  # tweak this threshold if needed
+        valid_peaks.append((y, x))
+peaks = np.array(valid_peaks)
+
+# ------------------------------
+# Visualization
+# ------------------------------
+print("creating figures...")
+plt.figure(figsize=(14, 6))
+
+plt.subplot(1, 3, 1)
+plt.title("Input Image")
+plt.imshow(image, cmap='gray')
+plt.colorbar()
+
+plt.subplot(1, 3, 2)
+plt.title("Matched Filter Response")
+plt.imshow(response, cmap='hot')
+plt.colorbar()
+
+plt.subplot(1, 3, 3)
+plt.title("Detected Dipoles (Filtered)")
+plt.imshow(image, cmap='gray')
+if len(peaks) > 0:
+    plt.scatter(peaks[:, 1], peaks[:, 0], color='lime', s=60, marker='x')
+plt.colorbar()
+
+plt.tight_layout()
+plt.show()
