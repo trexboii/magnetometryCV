@@ -1,0 +1,8 @@
+__pycache__
+.DS_Store
+venv
+venv.nosync
+venv312
+dipoles_detected.*
+*.tif
+*.tiff
